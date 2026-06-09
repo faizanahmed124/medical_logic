@@ -6,6 +6,11 @@ app_email = "Faizanahmed1295@gmail.com"
 app_license = "mit"
 
 # Apps
+
+override_doctype_class = {
+    "Expense Claim": "medical_logic.medical_logic.custom_expense_claim.CustomExpenseClaim"
+}
+
 # ------------------
 
 # required_apps = []
