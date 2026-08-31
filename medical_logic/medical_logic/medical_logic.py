@@ -125,8 +125,52 @@ def calculate_medical_amount(doc, method):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. EMPLOYEE — on_update hook (triggers on every save)
+# 1b. EMPLOYEE — eligibility warning on validate
 # ─────────────────────────────────────────────────────────────────────────────
+
+def warn_if_eligible_not_enabled(doc, method):
+    """
+    Shows a warning if the employee is eligible for Medical Allow
+    (3+ years from confirmation date) but it is NOT yet enabled.
+
+    - Permanent employees: auto_check_on_employee_update handles them,
+      but this also warns in case something was missed.
+    - Daily Wages: Admin must manually enable, so warning is critical here.
+
+    Hook: Employee -> validate
+    """
+    # Already enabled — no warning needed
+    if doc.get("custom_medical_allow"):
+        return
+
+    # Only warn Administrator (non-admins can't act on it anyway)
+    if frappe.session.user != "Administrator":
+        return
+
+    # Check eligibility date
+    ref_date = doc.get("final_confirmation_date") or doc.get("date_of_joining")
+    if not ref_date:
+        return
+
+    if getdate(nowdate()) < add_years(getdate(ref_date), 3):
+        return  # Not yet eligible — no warning
+
+    # Eligible but not enabled — show warning
+    employment_type = (doc.get("employment_type") or "").upper()
+    ref_label = "Final Confirmation Date" if doc.get("final_confirmation_date") \
+                else "Date of Joining"
+
+    frappe.msgprint(
+        _("⚠️ Employee {0} has completed 3+ years from {1} and is "
+          "eligible for Medical Allow, but it is currently NOT enabled. "
+          "Please enable it from the Company Benefits tab.").format(
+              doc.employee_name, ref_label
+          ),
+        indicator="orange",
+        title=_("Medical Allow — Eligibility Warning"),
+    )
+
+
 
 def auto_check_on_employee_update(doc, method):
     """
@@ -190,6 +234,31 @@ def auto_check_on_employee_update(doc, method):
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. EXPENSE CLAIM — submit & cancel hooks
 # ─────────────────────────────────────────────────────────────────────────────
+
+def validate_expense_claim_medical(doc, method):
+    """
+    Server-side block: prevent saving Expense Claim if employee
+    does not have Medical Allow enabled.
+    Works even if client script is bypassed (API, imports, etc.)
+
+    Hook: Expense Claim -> validate
+    """
+    employee = doc.employee
+    if not employee:
+        return
+
+    medical_allow, employee_name = frappe.db.get_value(
+        "Employee", employee, ["custom_medical_allow", "employee_name"]
+    ) or (0, employee)
+
+    if not medical_allow:
+        frappe.throw(
+            _("Medical Allow is not enabled for Employee {0}. "
+              "This Expense Claim cannot be saved.").format(
+                  employee_name or employee),
+            title=_("Medical Allow — Not Enabled"),
+        )
+
 
 def on_expense_claim_submit(doc, method):
     """
@@ -415,6 +484,83 @@ def yearly_medical_refresh():
         log.warning(f"yearly_refresh Failed: {failed}")
 
     _notify_admin_after_refresh(refreshed, failed)
+
+
+def notify_hr_about_eligible_employees():
+    """
+    Daily job: Find all employees who are eligible for Medical Allow
+    but do NOT have it enabled yet. Creates a Frappe Notification
+    for the Administrator so nothing gets missed.
+
+    - Permanent employees: auto_check handles them, but catches any failures.
+    - Daily Wages: must be manually enabled by Admin — this is the reminder.
+
+    Scheduled: daily
+    """
+    today = getdate(nowdate())
+    log   = frappe.logger("medical_logic")
+
+    pending = frappe.db.sql("""
+        SELECT   name, employee_name, employment_type,
+                 final_confirmation_date, date_of_joining, ctc
+        FROM     `tabEmployee`
+        WHERE    status               = 'Active'
+          AND    custom_medical_allow  = 0
+          AND    ctc                  > 0
+          AND    (final_confirmation_date IS NOT NULL OR date_of_joining IS NOT NULL)
+    """, as_dict=True)
+
+    eligible = []
+    for emp in pending:
+        ref_date = emp.final_confirmation_date or emp.date_of_joining
+        if not ref_date:
+            continue
+        if today >= add_years(getdate(ref_date), 3):
+            eligible.append(emp)
+
+    if not eligible:
+        return
+
+    # Build notification message
+    rows_html = "".join([
+        f"<tr><td>{e.name}</td><td>{e.employee_name}</td>"
+        f"<td>{e.employment_type}</td></tr>"
+        for e in eligible
+    ])
+
+    message = f"""
+        <p>The following <b>{len(eligible)}</b> employee(s) are eligible for
+        <b>Medical Allow</b> but it has not been enabled yet:</p>
+        <table border="1" cellpadding="5" cellspacing="0" style="border-collapse:collapse;width:100%">
+            <thead>
+                <tr style="background:#8B1A1A;color:white">
+                    <th>Employee ID</th>
+                    <th>Name</th>
+                    <th>Employment Type</th>
+                </tr>
+            </thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+        <p style="margin-top:10px">Please review and enable Medical Allow
+        from each employee's <b>Company Benefits</b> tab.</p>
+    """
+
+    # Create Frappe notification for Administrator
+    try:
+        frappe.get_doc({
+            "doctype":   "Notification Log",
+            "subject":   f"⚠️ {len(eligible)} Employee(s) Eligible for Medical Allow — Not Yet Enabled",
+            "for_user":  "Administrator",
+            "type":      "Alert",
+            "document_type": "Employee",
+            "message":   message,
+        }).insert(ignore_permissions=True)
+        frappe.db.commit()
+
+        log.info(f"notify_hr: Created notification for {len(eligible)} eligible employees.")
+
+    except Exception as exc:
+        log.error(f"notify_hr ERROR: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
