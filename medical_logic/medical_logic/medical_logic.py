@@ -318,9 +318,13 @@ def on_expense_claim_submit(doc, method):
 
 def on_expense_claim_cancel(doc, method):
     """
-    On Expense Claim cancel: reverse the medical deduction.
+    On Expense Claim cancel: mark it Cancelled and reverse the medical deduction.
     Hook: Expense Claim -> on_cancel
     """
+    # HRMS leaves Approval Status as "Approved" on cancel, so cancelled claims
+    # still looked approved (and were counted in reports filtered on Approved).
+    doc.db_set({"approval_status": "Cancelled", "status": "Cancelled"})
+
     employee = doc.employee
     if not employee:
         return
