@@ -30,8 +30,11 @@ doc_events = {
         ],
     },
     "Expense Claim": {
-        # Block save if employee doesn't have Medical Allow
-        "validate":  "medical_logic.medical_logic.medical_logic.validate_expense_claim_medical",
+        # Block save if employee doesn't have Medical Allow, then: limit / one bill a month / duplicates
+        "validate": [
+            "medical_logic.medical_logic.medical_logic.validate_expense_claim_medical",
+            "medical_logic.medical_logic.medical_bill_checks.validate_medical_claim",
+        ],
         "on_submit": "medical_logic.medical_logic.medical_logic.on_expense_claim_submit",
         "on_cancel": "medical_logic.medical_logic.medical_logic.on_expense_claim_cancel",
     },
