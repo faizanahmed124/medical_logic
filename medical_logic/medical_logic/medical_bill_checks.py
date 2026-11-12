@@ -5,8 +5,9 @@ Expense Claim -> validate (runs on save and on submit, also for API / import):
 
   1. Limit            - the medical amount of the claim must not be more than the employee's
                         remaining medical balance (never goes into minus). Blocked with a clear message.
-  2. One bill a month - an employee can have only ONE medical claim per month (month of the bill's
-                        Expense Date). A second claim for the same month is blocked.
+  2. One bill a month - an employee can have only ONE medical claim per month: the 'Bill of Month'
+                        of the claim (the month of the bill's Expense Date when the form has no such
+                        field). A second claim for the same month is blocked.
   3. No duplicates    - the same bill (Medicine Bill / Lab Test / Emergency Bill number) cannot be
                         claimed twice by the same employee, and a claim cannot hold the same line twice.
 
@@ -17,7 +18,6 @@ import frappe
 from frappe import _
 from frappe.utils import flt, get_first_day, get_last_day, getdate, formatdate
 
-from medical_logic.medical_logic.medical_logic import _get_medical_amount_from_claim
 
 BILL_FIELDS = {
     "custom_medicine_bill": "Medicine Bill",
@@ -54,22 +54,26 @@ def validate_medical_claim(doc, method=None):
     """Hook: Expense Claim -> validate"""
     if not doc.get("employee"):
         return
-    medical_lines = [l for l in (doc.get("expenses") or []) if _is_medical(l)]
+    lines = doc.get("expenses") or []
+    medical_lines = [l for l in lines if _is_medical(l)]
+    if not medical_lines and "medical" in _clean(doc.get("custom_expense_type")):
+        # the claim's Expense Type says medical, the lines just do not carry it (API / import)
+        medical_lines = list(lines)
     if not medical_lines:
         return
 
     check_duplicate_lines(doc, medical_lines)
     check_one_bill_a_month(doc, medical_lines)
     check_bill_not_claimed_before(doc, medical_lines)
-    check_medical_limit(doc)
+    check_medical_limit(doc, medical_lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. LIMIT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_medical_limit(doc):
-    claim_amount = _get_medical_amount_from_claim(doc)
+def check_medical_limit(doc, medical_lines):
+    claim_amount = round(sum(_line_amount(l) for l in medical_lines), 2)
     if claim_amount <= 0:
         return
 
@@ -139,7 +143,89 @@ def _active_medical_lines(employee, exclude_claim, date_from=None, date_to=None)
     )
 
 
+MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august",
+          "september", "october", "november", "december"]
+
+
+def _bill_month_fieldname():
+    """The 'Bill of Month' field of the Expense Claim (found by its label, so the fieldname of the
+    custom field does not have to be known). None when the form has no such field."""
+    for f in frappe.get_meta("Expense Claim").fields:
+        if (f.label or "").strip().lower() in ("bill of month", "bill month"):
+            return f.fieldname
+    return None
+
+
+def _month_number(value):
+    value = _clean(value)
+    if value.isdigit() and 1 <= int(value) <= 12:
+        return int(value)
+    for i, name in enumerate(MONTHS, start=1):
+        if value == name or value == name[:3]:
+            return i
+    return None
+
+
+def _bill_period(month_value, posting_date):
+    """(year, month) of a 'Bill of Month' value. The field holds only a month name, so the
+    year is the posting year, or the year before when the month is later than the posting month
+    (a December bill posted in January belongs to the previous year)."""
+    month = _month_number(month_value)
+    if not month:
+        return None
+    posting = getdate(posting_date)
+    return (posting.year if month <= posting.month else posting.year - 1, month)
+
+
+def check_one_bill_a_month_by_bill_month(doc, fieldname):
+    """One medical claim per employee per 'Bill of Month'."""
+    import re
+
+    if not re.fullmatch(r"[A-Za-z0-9_]+", fieldname):
+        return False
+    period = _bill_period(doc.get(fieldname), doc.get("posting_date"))
+    if not period:
+        return False
+
+    others = frappe.db.sql(
+        f"""
+        SELECT ec.name, ec.posting_date, ec.`{fieldname}` AS bill_month
+        FROM `tabExpense Claim` ec
+        WHERE ec.employee = %(employee)s
+          AND ec.name != %(exclude)s
+          AND ec.docstatus < 2
+          AND IFNULL(ec.approval_status, '') NOT IN ('Rejected', 'Cancelled')
+          AND IFNULL(ec.status, '') NOT IN ('Rejected', 'Cancelled')
+          AND IFNULL(ec.`{fieldname}`, '') != ''
+          AND EXISTS (
+                SELECT 1 FROM `tabExpense Claim Detail` ecd
+                WHERE ecd.parent = ec.name AND LOWER(IFNULL(ecd.expense_type, '')) LIKE '%%medical%%')
+        """,
+        {"employee": doc.employee, "exclude": doc.name or ""},
+        as_dict=True,
+    )
+    same = [o.name for o in others if _bill_period(o.bill_month, o.posting_date) == period]
+    if same:
+        frappe.throw(
+            _("{0} already has a medical bill for {1}: {2}.<br><br>"
+              "Only one medical bill is allowed for a month, so a second one cannot be made. "
+              "Cancel that claim first, or choose another Bill of Month.").format(
+                doc.get("employee_name") or doc.employee,
+                doc.get(fieldname),
+                ", ".join(sorted(same)),
+            ),
+            title=_("⚠️ Medical Bill Already Made For This Month"),
+        )
+    return True
+
+
 def check_one_bill_a_month(doc, medical_lines):
+    # The form has a 'Bill of Month' field: that is the month of the bill
+    fieldname = _bill_month_fieldname()
+    if fieldname and doc.get(fieldname) and check_one_bill_a_month_by_bill_month(doc, fieldname):
+        return
+
+    # No such field: the month of the bill's Expense Date
     months = {}
     for line in medical_lines:
         date = getdate(line.get("expense_date") or doc.get("posting_date"))
